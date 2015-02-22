@@ -1,0 +1,165 @@
+---
+title: "Applied Machine Learning::Final Report"
+author: "Felipe Campelo"
+date: "February 22, 2015"
+output: html_document
+---
+```{r preamble,echo=FALSE,results='hide'}
+rm(list=ls())   # Clean workspace
+```
+
+## Reading and preprocessing data
+The very first step is to read the data provided:
+
+```{r readdata,warning=FALSE}
+library(caret,quietly = TRUE)
+set.seed(20150223)
+TrainData<-read.table("pml-training.csv",
+                      header=T,
+                      sep=",",
+                      na.strings=c("NA"," ","#DIV/0!"))
+```
+
+Before doing anything with this data, we should set apart a few observations as our "test set", so that we can estimate the out of sample error and check whether or not our model is overfit to the training data. To keep it simple (given the reasonably large number of observations available) we'll use the 80:20 rule (i.e., set aside 20% of the available observations as the testing sample.).
+
+```{r splitdata, results='hide'}
+inTest<-sample.int(nrow(TrainData),ceiling(0.2*nrow(TrainData)))
+TestData<-TrainData[inTest,]    # won't be touched until we've trained our model
+TrainData<-TrainData[-inTest,]
+
+summary(TrainData) # not shown
+```
+
+It is clear from the summary (which was omitted here for the sake of brevity, but the reader can check it quite easily by running the code above) that many columns have large amounts of missing information and, therefore, will not contribute much as predictors. It is also important to notice that columns have either no NAs, or (nearly) all values missing. Of the 160 columns of the data set, we have 60 with all data, and 100 with over 95% of the data missing:
+
+```{r howmanyNAs}
+sum(colSums(is.na(TrainData))/nrow(TrainData)==0)     # no NAs
+sum(colSums(is.na(TrainData))/nrow(TrainData)>0.95)   # Over 95% NAs
+```
+
+It is safe to assume that variables with so many missing values will not provide useful information for our predictive model, and can therefore be safely removed prior to the analysis.
+
+Some of the other columns can also be removed prior to the model fitting, since they can be assumed not to contribute to our particular prediction task:  
+- Column 1 (X);  
+- Column 2 (user_name);  
+- Column 3 (raw`_`timestamp`_`part`_`1);  
+- Column 4 (raw`_`timestamp`_`part`_`2);  
+- Column 5 (cvtd_timestamp);  
+- Column 6 (new_window);  
+- Column 7 (num_window).
+
+```{r remvars1}
+remvars1<-c(1:7,                                              # cols 1:7
+            as.numeric(which(colSums(is.na(TrainData))>0)))   # cols with NAs
+```
+Prior to the training it is probably also good to randomize the order of the observations, so that any order-dependent effects (e.g., user-specific or time-specific) don't influence our model (particularly because we'll be using k-fold cross-validation for training our predictive model).
+
+```{r randrem}
+TrainData<-TrainData[sample.int(nrow(TrainData)),     # randomize rows
+                     -remvars1]                       # remove cols "remvars1"
+```
+
+It is important to check whether or not any extreme outliers are present. Here I arbitrarily define an outlier as a value removed from the 1st or 3rd quartile by more than 5*IQR values.
+
+```{r getoutls}
+get_outliers<-function(x,out_dist=5){
+    a<-fivenum(x)
+    iqr<-IQR(x)
+    outls<-sort(c(which(x < a[2]-out_dist*iqr),
+                  which(x > a[4]+out_dist*iqr)))
+    return(outls)
+}
+outls<-apply(TrainData[,-ncol(TrainData)],2,get_outliers)
+```
+
+Still adhering to the KISS^[[_Keep it simple stupid_](http://en.wikipedia.org/wiki/KISS_principle), a self-explanatory principle originally developed by SkunkWorks engineer Kelly Johnson in the 1960s] principle, lets just remove all variables that present more than 10 outliers, and then all the remaining outlying observations.
+
+```{r remvars2}
+remvars2<-which(as.numeric(lapply(outls,length))>=10)
+TrainData<-TrainData[,-remvars2]                    # remove cols "remvars2" 
+TrainData<-TrainData[-unique(                       # remove remaining outliers 
+                unlist(
+                    apply(
+                        TrainData[,-ncol(TrainData)],
+                        2,
+                        get_outliers))),]
+```
+
+This leaves `r ncol(TrainData)-1` predictors to be used in our predictive model. We now get them all centered and scaled:
+```{r centerscale}
+tmp<-preProcess(TrainData[,-ncol(TrainData)],
+                method = c("center", "scale"))
+
+TrainData[,-ncol(TrainData)]<-predict(tmp, 
+                                      TrainData[,-ncol(TrainData)])
+```
+
+## Model fitting and results
+In this work a Random Forest will be fit to the data. The resampling method for the model training will be 5-fold cross-validation, to reduce the probability of overfitting (which is usually something one should worry about when using Random Forests).
+
+```{r fitRF, cache=TRUE, warning=FALSE}
+modFit<-train(classe~.,
+              method="rf",
+              data=TrainData,
+              trControl = trainControl(method = "cv",
+                                       number = 5))
+```
+
+Presto! Lets check the in-sample accuracy:
+```{r isac,tidy=TRUE}
+modFit
+```
+An in-sample accuracy of over 99%: not bad! To rule out the possibility that this is simply the result of an overfit model, lets check the out-sample accuracy using the test data. First, we must preprocess the _TestData_ variable like we did with _TrainData_:
+
+```{r testpreproc}
+TestData<-TestData[,-remvars1]
+TestData<-TestData[,-remvars2]
+TestData[,-ncol(TestData)]<-predict(tmp, 
+                                    TestData[,-ncol(TestData)])
+```
+
+Now we calculate the out-sample error rates and confusion matrix
+```{r osac}
+testpred<-predict(modFit,
+                  TestData)
+table(testpred,
+      TestData$classe)
+M<-as.matrix(table(testpred,
+                   TestData$classe))
+sum(diag(M))/sum(M) # out-sample accuracy estimate
+```
+Our estimate for the out-sample accuracy is also over 99%, which is encouraging. We are now finally ready to sink our proverbial teeth into the actual problem at hand and get some actual predictions:
+
+``` {r validset}
+# Read data
+TestSet<-read.table("pml-testing.csv",
+                    header=T,
+                    sep=",",
+                    na.strings=c("NA"," ","#DIV/0!"))
+
+# Precondition data (like we did before with TrainData and TestData):
+TestSet<-TestSet[,-remvars1]
+TestSet<-TestSet[,-remvars2]
+TestSet[,-ncol(TestData)]<-predict(tmp,
+                                   TestSet[,-ncol(TestData)])
+
+# And use it for prediction!
+(answers<-as.character(predict(modFit,
+                               TestSet)))
+```
+
+All that is left to do is to write it into the proper output files and submit them for grading.
+
+```{r wrapup}
+# Write files for submission:
+pml_write_files = function(x){
+    n = length(x)
+    for(i in 1:n){
+        filename = paste0("answers/problem_id_",i,".txt")
+        write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+    }
+}
+pml_write_files(answers)
+```
+
+The predictions were all correct according to the grading system. Sweet! :)
